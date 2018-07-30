@@ -1,0 +1,13 @@
+airflow:
+  examples: true
+  executor: "Celery"
+  folders:
+    home:
+    dags: 
+  logging:
+    levels:
+  database:
+    url: 
+    user:
+redis:
+postgres:

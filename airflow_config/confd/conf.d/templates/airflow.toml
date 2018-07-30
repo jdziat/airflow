@@ -1,0 +1,8 @@
+[template]
+src = "airflow.cfg.tmpl"
+dest = "/tmp/airflow.cfg"
+keys = [
+    "/airflow/*",
+    "/redis/*",
+    "/postgres/*",
+]

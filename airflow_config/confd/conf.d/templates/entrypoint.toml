@@ -1,0 +1,8 @@
+[template]
+src = "entrypoint.sh.tmpl"
+dest = "/tmp/entrypoint.sh"
+keys = [
+    "/airflow/*",
+    "/redis/*",
+    "/postgres/*",
+]

@@ -1,0 +1,114 @@
+#!/bin/bash
+
+RETRIES={{getenv "RETRIES" (getv "/airflow/retries" "20")}}
+AIRFLOW_USER={{getenv "AIRFLOW_USER" (getv "/airflow/user" "airflow")}}
+AIRFLOW_HOME={{getenv "AIRFLOW_HOME" (getv "/airflow/folders/home" "/usr/local/airflow")}}
+DAGS_HOME={{getenv "DAGS_HOME" (getv "/airflow/folders/dags" "/usr/local/airflow/dags")}}
+{{$LOADEXAMPLES := getenv "LOAD_EXAMPLES" (getv "/airflow/examples" "true")}}
+REDIS_HOST={{getenv "REDIS_HOST" (getv "/redis/host" "redis")}}
+REDIS_PORT={{getenv "REDIS_PORT" (getv "/redis/port" "6379")}}
+REDIS_PASSWORD={{getenv "REDIS_PASSWORD" (getv "/redis/password" "")}}
+POSTGRES_USER={{getenv "POSTGRES_USER" (getv "/postgres/user" "airflow")}}
+POSTGRES_HOST={{getenv "POSTGRES_HOST" (getv "/postgres/host" "postgres")}}
+POSTGRES_PORT={{getenv "POSTGRES_PORT" (getv "/postgres/port" "5432")}}
+POSTGRES_PASSWORD={{getenv "POSTGRES_PASSWORD" (getv "/postgres/password" "airflow")}}
+POSTGRES_DB={{getenv "POSTGRES_DB" (getv "/postgres/database" "airflow")}}
+{{$CONFD_COMMAND := getenv "CONFD_COMMAND" (getv "/confd/cmd" "confd -onetime -backend=\"file\" /etc/confd/airflow.yaml")}}
+LOAD_EXAMPLES={{$LOADEXAMPLES}}
+# Defaults and back-compat
+: "${AIRFLOW__CORE__FERNET_KEY:=${FERNET_KEY:=$(python3 -c "from cryptography.fernet import Fernet; FERNET_KEY = Fernet.generate_key().decode(); print(FERNET_KEY)")}}"
+: "${AIRFLOW__CORE__EXECUTOR:=${EXECUTOR:-Sequential}Executor}"
+
+export \
+  AIRFLOW__CELERY__BROKER_URL \
+  AIRFLOW__CELERY__CELERY_RESULT_BACKEND \
+  AIRFLOW__CORE__EXECUTOR \
+  AIRFLOW__CORE__FERNET_KEY \
+  AIRFLOW__CORE__LOAD_EXAMPLES \
+  AIRFLOW__CORE__SQL_ALCHEMY_CONN \
+
+
+# Load DAGs exemples (default: Yes)
+if [[ -z "$AIRFLOW__CORE__LOAD_EXAMPLES" && "${LOAD_EXAMPLES:=n}" == n ]]
+then
+  AIRFLOW__CORE__LOAD_EXAMPLES=False
+fi
+
+{{$CONFD_COMMAND}}
+mkdir -p $AIRFLOW_HOME
+mkdir -p $DAGS_HOME
+cp /tmp/airflow.cfg $AIRFLOW_HOME
+{{if $LOADEXAMPLES}}
+cp -fr /usr/local/lib/python3.6/dist-packages/airflow/example_dags/* $DAGS_HOME
+{{end}}
+
+# Install custom python package if requirements.txt is present
+if [ -e "/requirements.txt" ]; then
+    $(which pip) install --user -r /requirements.txt
+fi
+
+if [ -n "$REDIS_PASSWORD" ]; then
+    REDIS_PREFIX=:${REDIS_PASSWORD}@
+else
+    REDIS_PREFIX=
+fi
+
+wait_for_port() {
+  local name="$1" host="$2" port="$3"
+  local j=0
+  while ! nc -z "$host" "$port" >/dev/null 2>&1 < /dev/null; do
+    j=$((j+1))
+    if [ $j -ge $RETRIES ]; then
+      echo >&2 "$(date) - $host:$port still not reachable, giving up"
+      exit 1
+    fi
+    echo >&2 "$(date) - Looking for service at $host:$port"
+    echo "$(date) - waiting for $name... $j/$RETRIES"
+    sleep 5
+  done
+}
+
+function dbIsReady() {
+  PGPASSWORD=$POSTGRES_PASSWORD \
+  psql -h $POSTGRES_HOST -U $POSTGRES_USER \
+       -d $POSTGRES_DB -c "select 1" \
+  > /dev/null 2>&1
+}
+
+if [ "$AIRFLOW__CORE__EXECUTOR" != "SequentialExecutor" ]; then
+  AIRFLOW__CORE__SQL_ALCHEMY_CONN="postgresql+psycopg2://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
+  AIRFLOW__CELERY__CELERY_RESULT_BACKEND="db+postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
+until dbIsReady || [ "$RETRIES" -lt 1 ] ; do
+  echo "$(date) - waiting for postgres... $((RETRIES--))"
+  sleep 5
+done
+#  wait_for_port "Redis" "$REDIS_HOST" "$REDIS_PORT" 
+fi
+
+if [ "$AIRFLOW__CORE__EXECUTOR" = "CeleryExecutor" ]; then
+  AIRFLOW__CELERY__BROKER_URL="redis://$REDIS_PREFIX$REDIS_HOST:$REDIS_PORT/1"
+  wait_for_port "Redis" "$REDIS_HOST" "$REDIS_PORT" 
+fi
+echo $1
+case "$1" in
+  webserver)
+    airflow initdb
+    if [ "$AIRFLOW__CORE__EXECUTOR" = "LocalExecutor" ]; then
+      # With the "Local" executor it should all run in one container.
+      airflow scheduler &
+    fi
+    exec airflow "$@"
+    ;;
+  worker|scheduler)
+    # To give the webserver time to run initdb.
+    sleep 10
+    exec airflow "$@"
+    ;;
+  flower|version)
+    exec airflow "$@"
+    ;;
+  *)
+    # The command is something like bash, not an airflow subcommand. Just run it in the right environment.
+    exec "$@"
+    ;;
+esac
