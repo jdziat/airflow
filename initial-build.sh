@@ -1,5 +1,7 @@
 #!/bin/bash
 
+mkdir ./volumes
+
 cd ./base
 echo "Building base container..."
 docker build -t jdziat/base ./
